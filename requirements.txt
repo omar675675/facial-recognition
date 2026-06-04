@@ -1,0 +1,7 @@
+onnxruntime-gpu
+opencv-python
+numpy
+psycopg2-binary
+qdrant-client
+pyyaml
+PyGObject
