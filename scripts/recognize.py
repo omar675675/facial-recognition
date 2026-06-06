@@ -36,7 +36,7 @@ from rtsp_trt import Pipeline, StatsEvent, DetectionEvent  # noqa: E402
 
 QDRANT_URL        = "http://localhost:6333"
 QDRANT_COLLECTION = "faces"
-MATCH_THRESHOLD   = 0.35
+ENROLL_CFG        = REPO_DIR / "config.yaml"
 
 # ── recognizer ─────────────────────────────────────────────────────────────────
 
@@ -77,15 +77,28 @@ def load_recognizer() -> Recognizer:
     return Recognizer(str(MODEL_PATH))
 
 
-def identify(qdrant: QdrantClient, embedding: np.ndarray) -> tuple[str, float]:
+def identify(qdrant: QdrantClient, embedding: np.ndarray,
+             match_threshold: float) -> tuple[str, float]:
     hits = qdrant.query_points(
         collection_name=QDRANT_COLLECTION,
         query=embedding.tolist(),
-        limit=1,
+        with_payload=True,
+        limit=5,
     ).points
-    if not hits or hits[0].score < MATCH_THRESHOLD:
-        return "Unknown", hits[0].score if hits else 0.0
-    return hits[0].payload["person_name"], hits[0].score
+    if not hits:
+        return "Unknown", 0.0
+
+    best_name, best_score = "Unknown", 0.0
+    for hit in hits:
+        stored = np.array(hit.payload["embeddings"], dtype=np.float32)
+        score  = float(np.dot(stored, embedding).max())
+        if score > best_score:
+            best_score = score
+            best_name  = hit.payload["person_name"]
+
+    if best_score < match_threshold:
+        return "Unknown", best_score
+    return best_name, best_score
 
 # ── drawing ────────────────────────────────────────────────────────────────────
 
@@ -115,14 +128,14 @@ _pending:      set  = set()  # streams with a recognition job already in-flight
 _lock = threading.Lock()
 
 
-def _recognize_frame(sid, frame, dets, fps, rec, qdrant):
+def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold):
     try:
         labels = []
         for x, y, w, h, _ in dets:
             crop = frame[y:y+h, x:x+w]
             if min(crop.shape[:2]) < 4:
                 continue
-            name, score = identify(qdrant, rec.embed(cv2.resize(crop, (112, 112))))
+            name, score = identify(qdrant, rec.embed(cv2.resize(crop, (112, 112))), match_threshold)
             labels.append((x, y, w, h, name, score))
             tag = f"{name}  {score*100:.0f}%" if name != "Unknown" else "Unknown"
             print(f"[detect] stream={sid}  {tag}  box=({x},{y},{w},{h})", flush=True)
@@ -135,23 +148,23 @@ def _recognize_frame(sid, frame, dets, fps, rec, qdrant):
             _pending.discard(sid)
 
 
-def _flush(sid, rec, qdrant, executor):
+def _flush(sid, rec, qdrant, executor, match_threshold):
     state = _accum.pop(sid)
     if sid in _pending:
         # recognition still running for this stream — drop frame to avoid queue buildup
         return
     _pending.add(sid)
     executor.submit(_recognize_frame, sid, state["frame"],
-                    state["dets"], _fps.get(sid, 0.0), rec, qdrant)
+                    state["dets"], _fps.get(sid, 0.0), rec, qdrant, match_threshold)
 
 
-def make_on_detection(rec, qdrant, executor):
+def make_on_detection(rec, qdrant, executor, match_threshold):
     def on_detection(d: DetectionEvent):
         sid, fnum = d.stream_id, d.frame_num
         with _lock:
             _latest_frame[sid] = np.array(d.frame)  # always keep newest frame for display
             if sid in _accum and _accum[sid]["fnum"] != fnum:
-                _flush(sid, rec, qdrant, executor)
+                _flush(sid, rec, qdrant, executor, match_threshold)
             if sid not in _accum:
                 _accum[sid] = {"fnum": fnum, "frame": d.frame, "dets": []}
             if d.conf > 0:
@@ -169,8 +182,16 @@ def make_on_stats():
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    enroll_cfg      = yaml.safe_load(ENROLL_CFG.read_text())
+    recog_cfg       = enroll_cfg["recognition"]
+    match_threshold = float(recog_cfg["similarity_threshold"])
+    engine_conf     = float(recog_cfg["engine"]["detection"]["conf_threshold"])
+    print(f"[config] similarity_threshold={match_threshold}  engine_conf={engine_conf}")
+
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else str(RTSP_TRT_DIR / "config.yaml")
     cfg      = yaml.safe_load(Path(cfg_path).read_text())
+    cfg.setdefault("detection", {})
+    cfg["detection"]["conf_threshold"] = engine_conf
     n        = len(cfg.get("streams", []))
 
     cell_w = cfg.get("tiler", {}).get("cell_width",  640)
@@ -188,7 +209,7 @@ def main():
         run_cfg = f.name
 
     p = Pipeline(run_cfg)
-    p.set_on_detection(make_on_detection(rec, qdrant, executor))
+    p.set_on_detection(make_on_detection(rec, qdrant, executor, match_threshold))
     p.set_on_stats(make_on_stats())
     p.start()
 
