@@ -1,6 +1,8 @@
 enrollment:
-  yaw_threshold: 10     # degrees — |yaw| > this → left or right
-  pitch_threshold: 10   # degrees — pitch > this → down; pitch < -this → up
+  yaw_threshold: 11    # degrees — |yaw| > this → left or right
+  pitch_threshold: 11  # degrees — pitch > this → down; pitch < -this → up
+  crop_padding: 0.0 # fraction of box size per side; negative = tighter, positive = more background
+  blur_threshold: 45  # Laplacian variance; ~30 (soft/permissive) → ~50 (sharp/strict)
 
   engine:
     detection:
@@ -8,33 +10,23 @@ enrollment:
       nms_threshold: 0.45    # non-maximum suppression overlap threshold
 
   mediapipe:
-    min_face_presence_score: 0.7   # confidence that a face is actually present
+    min_face_presence_score: 0.5
 
   augmentation:
-    # --- existing ---
-    blur:        {sigma: 1.2}
     jpeg:        {quality: 60}
     brightness:  {contrast: 1.1, shift: 15}
     gamma:       {gamma: 0.9}
     rotation:    {max_angle: 5}
     noise:       {sigma: 4}
     perspective: {strength: 0.05}
-    # --- pose & geometry ---
-    flip:        {}                          # horizontal mirror
-    # --- lighting ---
-    grayscale:   {}                          # channel-collapsed then back to BGR
-    # --- colour-space ---
-    hue_sat:     {hue_shift: 10, saturation_scale: 0.2}   # hue ±10°, sat ±20%
-    # --- occlusion ---
-    cutout:      {height: 28}               # erase bottom N px (lower face / mask)
-    # --- quality & domain ---
-    downscale:   {scale: 0.5}              # simulate low-res camera feed
-    motion_blur: {kernel_size: 5}          # horizontal motion blur
-    histogram_eq: {}                        # YUV-Y equalization for exposure shifts
+    hue_sat:     {hue_shift: 10, saturation_scale: 0.2}
 
 recognition:
+  crop_padding: 0.0 # fraction of box size per side; negative = tighter, positive = more background
+
   engine:
     detection:
       conf_threshold: 0.70   # minimum detection confidence (YOLOv12 face engine)
 
-  similarity_threshold: 0.30   # minimum cosine similarity to accept a match
+  similarity_threshold: 0.35   # minimum cosine similarity to accept a match
+  track_lock_threshold: 0.40   # minimum score to lock a label to a track ID; must be >= similarity_threshold

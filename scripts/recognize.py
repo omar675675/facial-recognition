@@ -32,6 +32,19 @@ MODEL_PATH   = REPO_DIR / "models" / "w600k_r50.engine"
 sys.path.insert(0, str(RTSP_TRT_DIR.parent))
 from rtsp_trt import Pipeline, StatsEvent, DetectionEvent  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from align import align_face, load_landmarker  # noqa: E402
+
+# FaceLandmarker isn't thread-safe → one instance per worker thread.
+_tls = threading.local()
+
+def _get_landmarker():
+    lm = getattr(_tls, "landmarker", None)
+    if lm is None:
+        lm = load_landmarker()
+        _tls.landmarker = lm
+    return lm
+
 # ── settings ───────────────────────────────────────────────────────────────────
 
 QDRANT_URL        = "http://localhost:6333"
@@ -79,26 +92,22 @@ def load_recognizer() -> Recognizer:
 
 def identify(qdrant: QdrantClient, embedding: np.ndarray,
              match_threshold: float) -> tuple[str, float]:
+    # Qdrant searches the indexed templates natively and returns the nearest
+    # one with its cosine score — payload is just the name (no matrices).
     hits = qdrant.query_points(
         collection_name=QDRANT_COLLECTION,
         query=embedding.tolist(),
         with_payload=True,
-        limit=5,
+        limit=1,
     ).points
     if not hits:
         return "Unknown", 0.0
 
-    best_name, best_score = "Unknown", 0.0
-    for hit in hits:
-        stored = np.array(hit.payload["embeddings"], dtype=np.float32)
-        score  = float(np.dot(stored, embedding).max())
-        if score > best_score:
-            best_score = score
-            best_name  = hit.payload["person_name"]
-
-    if best_score < match_threshold:
-        return "Unknown", best_score
-    return best_name, best_score
+    best = hits[0]
+    score = float(best.score)
+    if score < match_threshold:
+        return "Unknown", score
+    return best.payload["person_name"], score
 
 # ── drawing ────────────────────────────────────────────────────────────────────
 
@@ -120,25 +129,69 @@ def draw_fps(frame: np.ndarray, fps: float) -> None:
 
 # ── shared state ───────────────────────────────────────────────────────────────
 
-_accum:        dict = {}   # detection accumulator for the current frame
-_latest_frame: dict = {}   # newest raw frame per stream (always live)
-_labels:       dict = {}   # last-known recognition labels per stream
-_fps:          dict = {}
-_pending:      set  = set()  # streams with a recognition job already in-flight
+_accum:         dict = {}   # detection accumulator for the current frame
+_latest_frame:  dict = {}   # newest raw frame per stream (always live)
+_labels:        dict = {}   # last-known recognition labels per stream
+_track_labels:  dict = {}   # (sid, track_id) -> (name, score)  — locked labels per track
+_fps:           dict = {}
+_pending:       set  = set()  # streams with a recognition job already in-flight
 _lock = threading.Lock()
 
 
-def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold):
+def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold, crop_padding, track_lock_threshold):
     try:
         labels = []
-        for x, y, w, h, _ in dets:
-            crop = frame[y:y+h, x:x+w]
+        fh, fw = frame.shape[:2]
+        for x, y, w, h, _, track_id in dets:
+            pad_x = int(w * crop_padding)
+            pad_y = int(h * crop_padding)
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(fw, x + w + pad_x)
+            y2 = min(fh, y + h + pad_y)
+            crop = frame[y1:y2, x1:x2]
             if min(crop.shape[:2]) < 4:
                 continue
-            name, score = identify(qdrant, rec.embed(cv2.resize(crop, (112, 112))), match_threshold)
+
+            key = (sid, track_id)
+
+            # Align to the ArcFace template — must match enrollment exactly.
+            t0 = time.perf_counter()
+            aligned = align_face(crop, _get_landmarker())
+            t_align = time.perf_counter() - t0
+            if aligned is None:
+                # No landmarks (tiny / extreme-angle face). Feeding an unaligned
+                # crop to an aligned DB would pollute matching, so skip and keep
+                # this track's locked label if we have one.
+                if track_id > 0:
+                    with _lock:
+                        locked = _track_labels.get(key)
+                    if locked:
+                        labels.append((x, y, w, h, locked[0], locked[1]))
+                continue
+
+            t1 = time.perf_counter()
+            emb = rec.embed(aligned)
+            t_embed = time.perf_counter() - t1
+            t2 = time.perf_counter()
+            name, score = identify(qdrant, emb, match_threshold)
+            t_query = time.perf_counter() - t2
+
+            if track_id > 0:
+                if name != "Unknown" and score >= track_lock_threshold:
+                    with _lock:
+                        _track_labels[key] = (name, score)
+                elif name == "Unknown":
+                    with _lock:
+                        locked = _track_labels.get(key)
+                    if locked:
+                        name, score = locked
+
             labels.append((x, y, w, h, name, score))
             tag = f"{name}  {score*100:.0f}%" if name != "Unknown" else "Unknown"
-            print(f"[detect] stream={sid}  {tag}  box=({x},{y},{w},{h})", flush=True)
+            print(f"[detect] stream={sid}  track={track_id}  {tag}  box=({x},{y},{w},{h})  "
+                  f"align={t_align*1e3:.1f}ms embed={t_embed*1e3:.1f}ms query={t_query*1e3:.1f}ms", flush=True)
+
         with _lock:
             _labels[sid] = {"labels": labels, "fps": fps}
     except Exception as e:
@@ -148,28 +201,28 @@ def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold):
             _pending.discard(sid)
 
 
-def _flush(sid, rec, qdrant, executor, match_threshold):
+def _flush(sid, rec, qdrant, executor, match_threshold, crop_padding, track_lock_threshold):
     state = _accum.pop(sid)
     if sid in _pending:
         # recognition still running for this stream — drop frame to avoid queue buildup
         return
     _pending.add(sid)
     executor.submit(_recognize_frame, sid, state["frame"],
-                    state["dets"], _fps.get(sid, 0.0), rec, qdrant, match_threshold)
+                    state["dets"], _fps.get(sid, 0.0), rec, qdrant, match_threshold, crop_padding, track_lock_threshold)
 
 
-def make_on_detection(rec, qdrant, executor, match_threshold):
+def make_on_detection(rec, qdrant, executor, match_threshold, crop_padding, track_lock_threshold):
     def on_detection(d: DetectionEvent):
         sid, fnum = d.stream_id, d.frame_num
         with _lock:
             _latest_frame[sid] = np.array(d.frame)  # always keep newest frame for display
             if sid in _accum and _accum[sid]["fnum"] != fnum:
-                _flush(sid, rec, qdrant, executor, match_threshold)
+                _flush(sid, rec, qdrant, executor, match_threshold, crop_padding, track_lock_threshold)
             if sid not in _accum:
                 _accum[sid] = {"fnum": fnum, "frame": d.frame, "dets": []}
             if d.conf > 0:
                 _accum[sid]["dets"].append(
-                    (int(d.x), int(d.y), int(d.w), int(d.h), d.conf))
+                    (int(d.x), int(d.y), int(d.w), int(d.h), d.conf, d.track_id))
     return on_detection
 
 
@@ -184,9 +237,11 @@ def make_on_stats():
 def main():
     enroll_cfg      = yaml.safe_load(ENROLL_CFG.read_text())
     recog_cfg       = enroll_cfg["recognition"]
-    match_threshold = float(recog_cfg["similarity_threshold"])
-    engine_conf     = float(recog_cfg["engine"]["detection"]["conf_threshold"])
-    print(f"[config] similarity_threshold={match_threshold}  engine_conf={engine_conf}")
+    match_threshold   = float(recog_cfg["similarity_threshold"])
+    engine_conf       = float(recog_cfg["engine"]["detection"]["conf_threshold"])
+    crop_padding        = float(recog_cfg.get("crop_padding", 0.0))
+    track_lock_threshold = float(recog_cfg.get("track_lock_threshold", match_threshold))
+    print(f"[config] similarity_threshold={match_threshold}  track_lock_threshold={track_lock_threshold}  engine_conf={engine_conf}  crop_padding={crop_padding}")
 
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else str(RTSP_TRT_DIR / "config.yaml")
     cfg      = yaml.safe_load(Path(cfg_path).read_text())
@@ -209,7 +264,7 @@ def main():
         run_cfg = f.name
 
     p = Pipeline(run_cfg)
-    p.set_on_detection(make_on_detection(rec, qdrant, executor, match_threshold))
+    p.set_on_detection(make_on_detection(rec, qdrant, executor, match_threshold, crop_padding, track_lock_threshold))
     p.set_on_stats(make_on_stats())
     p.start()
 

@@ -9,9 +9,9 @@ Usage:
 import sys
 import tempfile
 import os
-from pathlib import Path
-
+import contextlib
 import urllib.request
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -22,7 +22,10 @@ import onnxruntime as ort
 import psycopg2
 import yaml
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue,
+)
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 
@@ -37,6 +40,9 @@ ENROLL_CFG     = REPO_DIR / "config.yaml"
 sys.path.insert(0, str(RTSP_TRT_DIR.parent))
 from rtsp_trt import Pipeline, DetectionEvent  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from align import align_face  # noqa: E402
+
 # ── settings ───────────────────────────────────────────────────────────────────
 
 PG_DSN            = "postgresql://fr:fr@localhost:5432/fr"
@@ -44,68 +50,66 @@ QDRANT_URL        = "http://localhost:6333"
 QDRANT_COLLECTION = "faces"
 EMBEDDING_DIM     = 512
 
-# ── head-pose (MediaPipe Tasks + solvePnP) ────────────────────────────────────
+# ── stdout suppressor (silences C-extension engine logs) ──────────────────────
 
-# Generic 3-D face model points (mm) matched to _LANDMARK_IDS
-_FACE_3D = np.array([
-    [  0.0,    0.0,    0.0],   # nose tip        (1)
-    [  0.0, -330.0,  -65.0],   # chin            (152)
-    [-225.0,  170.0, -135.0],  # left eye outer  (263)
-    [ 225.0,  170.0, -135.0],  # right eye outer (33)
-    [-150.0, -150.0, -125.0],  # left mouth      (287)
-    [ 150.0, -150.0, -125.0],  # right mouth     (57)
-], dtype=np.float64)
+@contextlib.contextmanager
+def _suppress_fd1():
+    fd = sys.stdout.fileno()
+    saved = os.dup(fd)
+    null  = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, fd)
+    os.close(null)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, fd)
+        os.close(saved)
 
-_LANDMARK_IDS  = [1, 152, 263, 33, 287, 57]
+# ── head-pose (MediaPipe FaceLandmarker + solvePnP) ───────────────────────────
+
 _LANDMARKER_MODEL = REPO_DIR / "models" / "face_landmarker.task"
 _LANDMARKER_URL   = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
 
+BUCKETS = ["front", "left", "right", "up", "down", "up_right", "up_left", "down_right", "down_left"]
 
-def _load_face_landmarker(min_face_presence_score: float = 0.5):
+_BUCKET_SCORE = {
+    "front":      lambda y, p: -(abs(y) + abs(p)),
+    "left":       lambda y, p: -y,
+    "right":      lambda y, p:  y,
+    "up":         lambda y, p: -p,
+    "down":       lambda y, p:  p,
+    "up_right":   lambda y, p:  y - p,
+    "up_left":    lambda y, p: -y - p,
+    "down_right": lambda y, p:  y + p,
+    "down_left":  lambda y, p: -y + p,
+}
+
+
+def load_pose_estimator() -> mp_vision.FaceLandmarker:
     if not _LANDMARKER_MODEL.exists():
         print(f"[mediapipe] downloading face_landmarker.task …")
         urllib.request.urlretrieve(_LANDMARKER_URL, str(_LANDMARKER_MODEL))
-    try:
-        opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(_LANDMARKER_MODEL)),
-            running_mode=mp_vision.RunningMode.IMAGE,
-            num_faces=1,
-            min_face_presence_score=min_face_presence_score,
-        )
-    except TypeError:
-        opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(_LANDMARKER_MODEL)),
-            running_mode=mp_vision.RunningMode.IMAGE,
-            num_faces=1,
-        )
+    opts = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(_LANDMARKER_MODEL)),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_faces=1,
+        output_facial_transformation_matrixes=True,
+    )
     return mp_vision.FaceLandmarker.create_from_options(opts)
 
 
-BUCKETS = ["front", "left", "right", "down", "up_right", "up_left", "down_right", "down_left"]
-
-
-def head_pose(crop_bgr: np.ndarray, landmarker: mp_vision.FaceLandmarker):
-    """Return (yaw_deg, pitch_deg) or (None, None) if no face detected."""
-    h, w = crop_bgr.shape[:2]
+def head_pose(crop_bgr: np.ndarray, landmarker: mp_vision.FaceLandmarker) -> tuple[float | None, float | None]:
+    """Return (yaw_deg, pitch_deg) or (None, None) if no face detected.
+    Uses MediaPipe's own facial transformation matrix — no custom solvePnP."""
     rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    result = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-
-    if not result.face_landmarks:
+    res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    if not res.face_landmarks or not res.facial_transformation_matrixes:
         return None, None
-
-    lm = result.face_landmarks[0]
-    pts2d = np.array([[lm[i].x * w, lm[i].y * h] for i in _LANDMARK_IDS], dtype=np.float64)
-
-    f = float(w)
-    cam = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
-    ok, rvec, _ = cv2.solvePnP(_FACE_3D, pts2d, cam, np.zeros((4, 1)), flags=cv2.SOLVEPNP_ITERATIVE)
-    if not ok:
-        return None, None
-
-    R, _ = cv2.Rodrigues(rvec)
+    R = np.array(res.facial_transformation_matrixes[0])[:3, :3]
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     if sy > 1e-6:
         pitch = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
@@ -113,10 +117,10 @@ def head_pose(crop_bgr: np.ndarray, landmarker: mp_vision.FaceLandmarker):
     else:
         pitch = np.degrees(np.arctan2(-R[1, 2], R[1, 1]))
         yaw   = np.degrees(np.arctan2(-R[2, 0], sy))
-    return yaw, pitch
+    return float(yaw), float(pitch)
 
 
-def angle_bucket(yaw: float, pitch: float, yaw_thresh: float, pitch_thresh: float):
+def angle_bucket(yaw: float, pitch: float, yaw_thresh: float, pitch_thresh: float) -> str | None:
     """Map (yaw, pitch) to one of the 8 bucket names, or None if unclassified."""
     is_left  = yaw   < -yaw_thresh
     is_right = yaw   >  yaw_thresh
@@ -130,20 +134,18 @@ def angle_bucket(yaw: float, pitch: float, yaw_thresh: float, pitch_thresh: floa
     if is_right:             return "right"
     if is_left:              return "left"
     if is_down:              return "down"
-    if not is_up:            return "front"
-    return None  # pure up — no bucket defined
+    if is_up:                return "up"
+    return "front"
 
 # ── ArcFace recognizer ─────────────────────────────────────────────────────────
 
 def load_recognizer() -> ort.InferenceSession:
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    sess = ort.InferenceSession(str(MODEL_PATH), providers=providers)
-    print(f"[recognizer] loaded {MODEL_PATH.name} ({sess.get_providers()[0]})")
-    return sess
+    return ort.InferenceSession(str(MODEL_PATH), providers=providers)
 
 
 def extract_embedding(sess: ort.InferenceSession, crop_bgr: np.ndarray) -> np.ndarray:
-    """112×112 BGR uint8 → 512-d L2-normalised float32 embedding."""
+    """112×112 BGR → 512-d L2-normalised float32 embedding."""
     img = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     img = (img - 127.5) / 127.5
     img = img.transpose(2, 0, 1)[np.newaxis]
@@ -271,49 +273,76 @@ def ensure_qdrant_collection(client: QdrantClient):
         )
 
 
-def replace_qdrant_point(client: QdrantClient, person_id: int,
-                          person_name: str, embeddings: list,
-                          anchor_vec: np.ndarray):
-    matrix = np.stack(embeddings)
-    client.upsert(
+def replace_person_points(client: QdrantClient, person_id: int,
+                          person_name: str, embeddings: list):
+    """Store one searchable point per template (payload = name only).
+
+    Qdrant indexes and searches the vectors itself, so recognition never has
+    to ship embedding matrices back over the wire or rerank in Python.
+    """
+    # Drop this person's previous templates, then insert the fresh set.
+    client.delete(
         collection_name=QDRANT_COLLECTION,
-        points=[
-            PointStruct(
-                id=person_id,
-                vector=anchor_vec.tolist(),
-                payload={
-                    "person_id": person_id,
-                    "person_name": person_name,
-                    "embeddings": matrix.tolist(),
-                },
-            )
-        ],
+        points_selector=Filter(must=[
+            FieldCondition(key="person_id", match=MatchValue(value=person_id))
+        ]),
     )
+    points = [
+        PointStruct(
+            id=person_id * 100_000 + i,
+            vector=emb.tolist(),
+            payload={"person_id": person_id, "person_name": person_name},
+        )
+        for i, emb in enumerate(embeddings)
+    ]
+    client.upsert(collection_name=QDRANT_COLLECTION, points=points)
 
 # ── enrollment logic ───────────────────────────────────────────────────────────
 
 def collect_crops(video_path: Path, yaw_thresh: float, pitch_thresh: float,
                   landmarker: mp_vision.FaceLandmarker,
-                  engine_conf: float, engine_nms: float) -> dict:
-    """Run rtsp_trt on the video; return one 112×112 crop per angle bucket."""
-    buckets: dict[str, np.ndarray] = {}
+                  engine_conf: float, engine_nms: float,
+                  crop_padding: float = 0.0,
+                  blur_thresh: float = 0.0) -> dict:
+    """Run rtsp_trt on the video; return one 112×112 crop per angle bucket.
+    Keeps the most extreme (best-representative) frame per bucket."""
+    candidates: dict[str, tuple[float, np.ndarray]] = {}
 
     def on_detection(d: DetectionEvent):
-        if len(buckets) == len(BUCKETS):
+        if d.conf == 0:
             return
         x, y, w, h = int(d.x), int(d.y), int(d.w), int(d.h)
-        crop = d.frame[y:y+h, x:x+w]
-        if min(crop.shape[:2]) < 4:
-            return
-        crop = cv2.resize(crop, (112, 112))
+        fh, fw = d.frame.shape[:2]
 
-        yaw, pitch = head_pose(crop, landmarker)
+        pose_crop = d.frame[y:y+h, x:x+w]
+        if min(pose_crop.shape[:2]) < 4:
+            return
+        pose_112 = cv2.resize(pose_crop, (112, 112))
+        gray = cv2.cvtColor(pose_112, cv2.COLOR_BGR2GRAY)
+        if cv2.Laplacian(gray, cv2.CV_64F).var() < blur_thresh:
+            return
+        yaw, pitch = head_pose(pose_112, landmarker)
         if yaw is None:
             return
 
         bucket = angle_bucket(yaw, pitch, yaw_thresh, pitch_thresh)
-        if bucket and bucket not in buckets:
-            buckets[bucket] = crop
+        print(f"  [debug] yaw={yaw:+.1f}  pitch={pitch:+.1f}  → {bucket or 'none'}", file=sys.stderr)
+        if not bucket:
+            return
+
+        pad_x = int(w * crop_padding)
+        pad_y = int(h * crop_padding)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(fw, x + w + pad_x)
+        y2 = min(fh, y + h + pad_y)
+        # Keep the full-res box crop; alignment (which needs sharp landmarks)
+        # runs once per winning bucket after the pass, not per frame.
+        crop = d.frame[y1:y2, x1:x2].copy()
+
+        score = _BUCKET_SCORE[bucket](yaw, pitch)
+        if bucket not in candidates or score > candidates[bucket][0]:
+            candidates[bucket] = (score, crop)
 
     cfg = yaml.safe_load(RTSP_TRT_CFG.read_text())
     cfg["streams"] = [str(video_path)]
@@ -327,13 +356,22 @@ def collect_crops(video_path: Path, yaw_thresh: float, pitch_thresh: float,
         tmp = f.name
 
     try:
-        p = Pipeline(tmp)
-        p.set_on_detection(on_detection)
-        p.run()
+        with _suppress_fd1():
+            p = Pipeline(tmp)
+            p.set_on_detection(on_detection)
+            p.run()
+            del p
     finally:
         os.unlink(tmp)
 
-    return buckets
+    aligned = {}
+    for b, (_, box_crop) in candidates.items():
+        crop = align_face(box_crop, landmarker)
+        if crop is None:
+            print(f"  [warn] alignment failed for bucket {b}; skipping", file=sys.stderr)
+            continue
+        aligned[b] = crop
+    return aligned
 
 
 def enroll_video(video_path: Path, sess: ort.InferenceSession,
@@ -341,51 +379,37 @@ def enroll_video(video_path: Path, sess: ort.InferenceSession,
                  yaw_thresh: float, pitch_thresh: float,
                  landmarker: mp_vision.FaceLandmarker,
                  engine_conf: float, engine_nms: float,
-                 aug_cfg: dict | None = None):
-    aug_cfg = aug_cfg or {}
+                 aug_cfg: dict | None = None,
+                 crop_padding: float = 0.0,
+                 blur_thresh: float = 0.0):
+    aug_cfg  = aug_cfg or {}
+    name     = video_path.stem.replace("_", " ").title()
+    buckets  = collect_crops(video_path, yaw_thresh, pitch_thresh, landmarker,
+                             engine_conf, engine_nms, crop_padding, blur_thresh)
 
-    name = video_path.stem.replace("_", " ").title()
-    print(f"\n── {name}  ({video_path.name})")
-
-    print("  [1/3] collecting crops by angle...")
-    buckets = collect_crops(video_path, yaw_thresh, pitch_thresh, landmarker,
-                            engine_conf, engine_nms)
-    captured = list(buckets.keys())
-    missing  = [b for b in BUCKETS if b not in buckets]
-    print(f"        captured: {captured}")
-    if missing:
-        print(f"        missing:  {missing}")
+    captured    = list(buckets.keys())
+    missing     = [b for b in BUCKETS if b not in buckets]
+    missing_str = "  missing: " + ", ".join(missing) if missing else ""
+    print(f"{name:<20} captured: {', '.join(captured) or 'none'}{missing_str}")
 
     if not buckets:
-        print("        no faces detected — skipping")
         return
 
     crop_dir = EMBEDDINGS_DIR / video_path.stem
+    if crop_dir.exists():
+        for f in crop_dir.glob("*.jpg"):
+            f.unlink()
     crop_dir.mkdir(parents=True, exist_ok=True)
 
-    print("  [2/3] extracting embeddings...")
     embeddings = []
-    total_saved = 0
     for bucket, crop in buckets.items():
-        variants = augment_crops(crop, aug_cfg)
-        for aug_name, aug_crop in variants:
+        for aug_name, aug_crop in augment_crops(crop, aug_cfg):
             fname = f"{bucket}.jpg" if aug_name == "original" else f"{bucket}_{aug_name}.jpg"
             cv2.imwrite(str(crop_dir / fname), aug_crop)
-            total_saved += 1
             embeddings.append(extract_embedding(sess, aug_crop))
-    aug_per_crop = len(embeddings) // len(buckets) if buckets else 0
-    print(f"        saved {total_saved} crops → {crop_dir}")
-    print(f"        {len(embeddings)} embeddings ({len(buckets)} crops × {aug_per_crop} variants)")
-
-    print("  [3/3] storing...")
-    bucket_names  = list(buckets.keys())
-    aug_per_crop  = len(embeddings) // len(buckets)
-    front_idx     = bucket_names.index("front") if "front" in bucket_names else 0
-    anchor_vec    = embeddings[front_idx * aug_per_crop]
 
     person_id = upsert_person(pg_conn, name)
-    replace_qdrant_point(qdrant, person_id, name, embeddings, anchor_vec)
-    print(f"        PostgreSQL id={person_id}  |  1 point ({len(embeddings)} embeddings) → Qdrant  ✓")
+    replace_person_points(qdrant, person_id, name, embeddings)
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
@@ -396,11 +420,9 @@ def main():
     pitch_thresh = float(enroll["pitch_threshold"])
     engine_conf  = float(enroll["engine"]["detection"]["conf_threshold"])
     engine_nms   = float(enroll["engine"]["detection"]["nms_threshold"])
-    mp_presence  = float(enroll["mediapipe"]["min_face_presence_score"])
+    crop_padding = float(enroll.get("crop_padding", 0.0))
+    blur_thresh  = float(enroll.get("blur_threshold", 0.0))
     aug_cfg      = enroll["augmentation"]
-    print(f"[config] yaw={yaw_thresh}°  pitch={pitch_thresh}°  "
-          f"engine_conf={engine_conf}  engine_nms={engine_nms}  "
-          f"mp_presence={mp_presence}  augmentations={list(aug_cfg.keys())}")
 
     exts  = ("*.mp4", "*.MP4", "*.mov", "*.MOV", "*.avi", "*.AVI", "*.mkv")
     paths = [p for ext in exts for p in sorted(ENROLLMENT_DIR.glob(ext))]
@@ -410,7 +432,7 @@ def main():
         return
 
     sess       = load_recognizer()
-    landmarker = _load_face_landmarker(mp_presence)
+    landmarker = load_pose_estimator()
     pg_conn    = psycopg2.connect(PG_DSN)
     qdrant     = QdrantClient(url=QDRANT_URL)
 
@@ -419,10 +441,10 @@ def main():
 
     for p in paths:
         enroll_video(p, sess, pg_conn, qdrant, yaw_thresh, pitch_thresh,
-                     landmarker, engine_conf, engine_nms, aug_cfg)
+                     landmarker, engine_conf, engine_nms, aug_cfg, crop_padding, blur_thresh)
 
     pg_conn.close()
-    print("\nDone.")
+    print("Done.")
 
 
 if __name__ == "__main__":
