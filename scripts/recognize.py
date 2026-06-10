@@ -141,33 +141,14 @@ def identify(qdrant: QdrantClient, embedding: np.ndarray,
         return "Unknown", score
     return best.payload["person_name"], score
 
-# ── drawing ────────────────────────────────────────────────────────────────────
-
-def draw_detection(frame: np.ndarray, x: int, y: int, w: int, h: int,
-                   name: str, score: float) -> None:
-    known = name != "Unknown"
-    color = (0, 210, 0) if known else (0, 50, 200)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-    label = f"{name}  {score * 100:.0f}%" if known else "Unknown"
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
-    cv2.rectangle(frame, (x, y - th - 12), (x + tw + 8, y), color, -1)
-    cv2.putText(frame, label, (x + 4, y - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-
-
-def draw_fps(frame: np.ndarray, fps: float) -> None:
-    cv2.putText(frame, f"FPS {fps:.1f}", (10, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 210, 0), 2, cv2.LINE_AA)
-
 # ── shared state ───────────────────────────────────────────────────────────────
 
-_accum:         dict = {}   # detection accumulator for the current frame
-_latest_frame:  dict = {}   # newest raw frame per stream (always live)
-_labels:        dict = {}   # last-known recognition labels per stream
-_track_labels:  dict = {}   # (sid, track_id) -> (name, score)  — locked labels per track
-_fps:           dict = {}
-_pending:       set  = set()  # streams with a recognition job already in-flight
-_recog_count:   dict = {}   # sid -> cumulative faces recognized (for throughput stats)
+_accum:        dict = {}   # detection accumulator for the current frame
+_track_labels: dict = {}   # (sid, track_id) -> (name, score)  — locked labels per track
+_labels:       dict = {}   # last-known recognition labels per stream
+_fps:          dict = {}
+_pending:      set  = set()  # streams with a recognition job already in-flight
+_recog_count:  dict = {}   # sid -> cumulative faces recognized (for throughput stats)
 _lock = threading.Lock()
 
 
@@ -249,7 +230,6 @@ def make_on_detection(rec, qdrant, executor, match_threshold, crop_padding, trac
     def on_detection(d: DetectionEvent):
         sid, fnum = d.stream_id, d.frame_num
         with _lock:
-            _latest_frame[sid] = np.array(d.frame)  # always keep newest frame for display
             if sid in _accum and _accum[sid]["fnum"] != fnum:
                 _flush(sid, rec, qdrant, executor, match_threshold, crop_padding, track_lock_threshold)
             if sid not in _accum:
@@ -302,12 +282,6 @@ def main():
             print(f"        {s}")
     n        = len(streams)
 
-    cell_w = cfg.get("tiler", {}).get("cell_width",  640)
-    cell_h = cfg.get("tiler", {}).get("cell_height", 360)
-    cols   = min(n, cfg.get("tiler", {}).get("columns", 2))
-    rows   = (n + cols - 1) // cols
-    win_w, win_h = cols * cell_w, rows * cell_h
-
     global _scrfd
     rec     = load_recognizer()
     _scrfd   = load_scrfd()
@@ -331,51 +305,31 @@ def main():
         print("Pipeline failed to start")
         return
 
-    print("Running — press Esc to quit")
+    print("Running — press Ctrl-C to quit")
     last_report = time.monotonic()
     last_count  = 0
     try:
         while p.running:
             with _lock:
-                live   = dict(_latest_frame)
-                labels = dict(_labels)
-                fps_snap = dict(_fps)
+                fps_snap    = dict(_fps)
                 total_recog = sum(_recog_count.values())
 
             now = time.monotonic()
             if now - last_report >= 2.0:
-                dt   = now - last_report
-                rate = (total_recog - last_count) / dt
+                dt      = now - last_report
+                rate    = (total_recog - last_count) / dt
                 fps_str = "  ".join(f"s{sid}:{fps_snap.get(sid,0.0):.0f}"
                                     for sid in sorted(fps_snap))
                 print(f"[stats] recog={rate:5.0f}/s   pipeline_fps  {fps_str}", flush=True)
                 last_report, last_count = now, total_recog
 
-            if live:
-                canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
-                for sid, frame in live.items():
-                    r, c         = divmod(sid, cols)
-                    cell         = cv2.resize(frame, (cell_w, cell_h))
-                    src_h, src_w = frame.shape[:2]
-                    sx, sy       = cell_w / src_w, cell_h / src_h
-                    for x, y, w, h, name, score in labels.get(sid, {}).get("labels", []):
-                        draw_detection(cell,
-                                       int(x*sx), int(y*sy),
-                                       int(w*sx), int(h*sy),
-                                       name, score)
-                    draw_fps(cell, fps_snap.get(sid, 0.0))
-                    canvas[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w] = cell
-                cv2.imshow("Recognition", canvas)
-
-            if cv2.waitKey(30) == 27:
-                break
+            time.sleep(0.03)
 
     except KeyboardInterrupt:
         pass
     finally:
         p.stop()
         executor.shutdown(wait=False)
-        cv2.destroyAllWindows()
         os.unlink(run_cfg)
 
 

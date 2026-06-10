@@ -32,7 +32,6 @@ from qdrant_client.models import (
 REPO_DIR       = Path(__file__).resolve().parent.parent
 RTSP_TRT_DIR   = REPO_DIR.parent / "rtsp_trt"
 ENROLLMENT_DIR = REPO_DIR / "enrollment_videos"
-EMBEDDINGS_DIR = REPO_DIR / "embeddings"
 MODEL_PATH     = REPO_DIR / "models" / "w600k_r50.onnx"
 RTSP_TRT_CFG   = RTSP_TRT_DIR / "config.yaml"
 ENROLL_CFG     = REPO_DIR / "config.yaml"
@@ -395,17 +394,9 @@ def enroll_video(video_path: Path, sess: ort.InferenceSession,
     if not buckets:
         return
 
-    crop_dir = EMBEDDINGS_DIR / video_path.stem
-    if crop_dir.exists():
-        for f in crop_dir.glob("*.jpg"):
-            f.unlink()
-    crop_dir.mkdir(parents=True, exist_ok=True)
-
     embeddings = []
     for bucket, crop in buckets.items():
-        for aug_name, aug_crop in augment_crops(crop, aug_cfg):
-            fname = f"{bucket}.jpg" if aug_name == "original" else f"{bucket}_{aug_name}.jpg"
-            cv2.imwrite(str(crop_dir / fname), aug_crop)
+        for _, aug_crop in augment_crops(crop, aug_cfg):
             embeddings.append(extract_embedding(sess, aug_crop))
 
     person_id = upsert_person(pg_conn, name)
