@@ -8,37 +8,25 @@ transform. The *exact same* alignment must be applied at enrollment and at
 recognition time — otherwise stored and live embeddings live in different
 spaces and matching degrades.
 
-The detector exposes no keypoints, so we derive the 5 points from MediaPipe
-FaceLandmarker (already a dependency) and warp to InsightFace's standard
-112x112 template.
+Keypoints come from SCRFD (InsightFace `det_10g`): it emits 5 points in the
+exact order ArcFace was trained on, and its onnxruntime session is thread-safe
+so one shared instance serves the whole worker pool.
+
+It runs on **CPU on purpose**. On GPU it's faster per-call (~2ms) but it then
+fights the dGPU that's already saturated with decode + detect + embed — at ~10
+streams that collapses alignment to 40–250ms AND collides with the detector's
+CUDA-graph capture (CUDA error 906). On CPU (~5–9ms/face, ~600/s across the
+pool) it stays off the dGPU entirely: no contention, no stream conflict.
 """
 
 from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-
-_LANDMARKER_MODEL = Path(__file__).resolve().parent.parent / "models" / "face_landmarker.task"
-
-
-def load_landmarker() -> mp_vision.FaceLandmarker:
-    """Create a single-face FaceLandmarker in IMAGE mode.
-
-    Not thread-safe — give each worker thread its own instance.
-    """
-    opts = mp_vision.FaceLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(_LANDMARKER_MODEL)),
-        running_mode=mp_vision.RunningMode.IMAGE,
-        num_faces=1,
-    )
-    return mp_vision.FaceLandmarker.create_from_options(opts)
 
 # InsightFace / ArcFace canonical 5-point template for a 112x112 crop.
-# Order: left-eye, right-eye, nose, left-mouth, right-mouth — where
-# "left" / "right" mean the LEFT / RIGHT side of the image.
+# Order matches SCRFD's kps output: left-eye, right-eye, nose, left-mouth,
+# right-mouth (where "left"/"right" mean the LEFT/RIGHT side of the image).
 _ARCFACE_TEMPLATE = np.array([
     [38.2946, 51.6963],   # left eye  (image-left)
     [73.5318, 51.5014],   # right eye (image-right)
@@ -47,31 +35,36 @@ _ARCFACE_TEMPLATE = np.array([
     [70.7299, 92.2041],   # right mouth corner (image-right)
 ], dtype=np.float32)
 
-# MediaPipe FaceLandmarker indices reduced to the 5 ArcFace points.
-# Eye centres are the midpoint of (outer, inner) corners. Image-left points
-# correspond to the subject's right-side features (frontal convention).
-_MP_5PT = (
-    (33, 133),    # left eye  (image-left)  = subject's right eye
-    (362, 263),   # right eye (image-right) = subject's left eye
-    (1,),         # nose tip
-    (61,),        # left mouth corner  (image-left)
-    (291,),       # right mouth corner (image-right)
-)
+_SCRFD_MODEL = Path.home() / ".insightface" / "models" / "buffalo_l" / "det_10g.onnx"
+_SCRFD_INPUT = 160   # det input size; face crops letterbox into this. 160 ≈ 2ms, 128 ≈ 1.7ms.
 
 
-def landmarks_5pt(crop_bgr: np.ndarray, landmarker) -> np.ndarray | None:
-    """Return a 5x2 float32 array of (x, y) pixel coords, or None if no face."""
-    h, w = crop_bgr.shape[:2]
-    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-    if not res.face_landmarks:
-        return None
-    lm = res.face_landmarks[0]
-    pts = np.empty((5, 2), dtype=np.float32)
-    for i, idxs in enumerate(_MP_5PT):
-        pts[i, 0] = np.mean([lm[j].x for j in idxs]) * w
-        pts[i, 1] = np.mean([lm[j].y for j in idxs]) * h
-    return pts
+def load_scrfd(input_size: int = _SCRFD_INPUT):
+    """Load SCRFD det_10g on CPU (one shared, thread-safe instance).
+
+    intra_op_num_threads=1 so each concurrent detect() uses a single core —
+    parallelism comes from the worker pool, which avoids oversubscribing the
+    CPU when many faces align at once. We pre-warm once so SCRFD's per-(stride)
+    anchor cache is populated; after that concurrent detect() calls only read
+    it, so there's no write race.
+    """
+    if not _SCRFD_MODEL.exists():
+        raise FileNotFoundError(
+            f"{_SCRFD_MODEL} not found. Fetch it once with:\n"
+            "  python -c \"import insightface; insightface.app.FaceAnalysis(name='buffalo_l')\""
+        )
+    import onnxruntime as ort
+    ort.set_default_logger_severity(3)   # silence SCRFD's 640-baked anchor-size warnings
+    from insightface.model_zoo.scrfd import SCRFD
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    so.inter_op_num_threads = 1
+    sess = ort.InferenceSession(str(_SCRFD_MODEL), sess_options=so,
+                                providers=["CPUExecutionProvider"])
+    det = SCRFD(str(_SCRFD_MODEL), session=sess)
+    det.prepare(ctx_id=-1, input_size=(input_size, input_size))   # ctx_id<0 → CPU
+    det.detect(np.zeros((input_size, input_size, 3), np.uint8))    # warm the anchor cache
+    return det
 
 
 def align_from_5pt(crop_bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray | None:
@@ -83,9 +76,13 @@ def align_from_5pt(crop_bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray | None:
                           borderValue=0)
 
 
-def align_face(crop_bgr: np.ndarray, landmarker) -> np.ndarray | None:
-    """Detect 5 landmarks and return the aligned 112x112 crop, or None."""
-    pts = landmarks_5pt(crop_bgr, landmarker)
-    if pts is None:
+def align_face(crop_bgr: np.ndarray, det) -> np.ndarray | None:
+    """Detect 5 SCRFD keypoints in the crop and return the aligned 112x112 face.
+
+    Returns None if no face is found (tiny / extreme-angle / blurred) — callers
+    must not feed an unaligned crop to the aligned DB.
+    """
+    _, kpss = det.detect(crop_bgr)
+    if kpss is None or len(kpss) == 0:
         return None
-    return align_from_5pt(crop_bgr, pts)
+    return align_from_5pt(crop_bgr, kpss[0].astype(np.float32))

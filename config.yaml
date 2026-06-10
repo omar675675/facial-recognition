@@ -6,7 +6,7 @@ enrollment:
 
   engine:
     detection:
-      conf_threshold: 0.70   # minimum detection confidence (YOLOv12 face engine)
+      conf_threshold: 0.50   # minimum detection confidence (YOLOv12 face engine)
       nms_threshold: 0.45    # non-maximum suppression overlap threshold
 
   mediapipe:

@@ -41,7 +41,7 @@ sys.path.insert(0, str(RTSP_TRT_DIR.parent))
 from rtsp_trt import Pipeline, DetectionEvent  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from align import align_face  # noqa: E402
+from align import align_face, load_scrfd  # noqa: E402
 
 # ── settings ───────────────────────────────────────────────────────────────────
 
@@ -300,7 +300,7 @@ def replace_person_points(client: QdrantClient, person_id: int,
 # ── enrollment logic ───────────────────────────────────────────────────────────
 
 def collect_crops(video_path: Path, yaw_thresh: float, pitch_thresh: float,
-                  landmarker: mp_vision.FaceLandmarker,
+                  landmarker: mp_vision.FaceLandmarker, det,
                   engine_conf: float, engine_nms: float,
                   crop_padding: float = 0.0,
                   blur_thresh: float = 0.0) -> dict:
@@ -366,7 +366,7 @@ def collect_crops(video_path: Path, yaw_thresh: float, pitch_thresh: float,
 
     aligned = {}
     for b, (_, box_crop) in candidates.items():
-        crop = align_face(box_crop, landmarker)
+        crop = align_face(box_crop, det)
         if crop is None:
             print(f"  [warn] alignment failed for bucket {b}; skipping", file=sys.stderr)
             continue
@@ -377,14 +377,14 @@ def collect_crops(video_path: Path, yaw_thresh: float, pitch_thresh: float,
 def enroll_video(video_path: Path, sess: ort.InferenceSession,
                  pg_conn, qdrant: QdrantClient,
                  yaw_thresh: float, pitch_thresh: float,
-                 landmarker: mp_vision.FaceLandmarker,
+                 landmarker: mp_vision.FaceLandmarker, det,
                  engine_conf: float, engine_nms: float,
                  aug_cfg: dict | None = None,
                  crop_padding: float = 0.0,
                  blur_thresh: float = 0.0):
     aug_cfg  = aug_cfg or {}
     name     = video_path.stem.replace("_", " ").title()
-    buckets  = collect_crops(video_path, yaw_thresh, pitch_thresh, landmarker,
+    buckets  = collect_crops(video_path, yaw_thresh, pitch_thresh, landmarker, det,
                              engine_conf, engine_nms, crop_padding, blur_thresh)
 
     captured    = list(buckets.keys())
@@ -432,16 +432,17 @@ def main():
         return
 
     sess       = load_recognizer()
-    landmarker = load_pose_estimator()
+    landmarker = load_pose_estimator()   # MediaPipe — pose bucketing only (offline, speed irrelevant)
+    det        = load_scrfd()            # SCRFD — alignment, identical to recognition
     pg_conn    = psycopg2.connect(PG_DSN)
-    qdrant     = QdrantClient(url=QDRANT_URL)
+    qdrant     = QdrantClient(url=QDRANT_URL, prefer_grpc=True)
 
     ensure_pg_schema(pg_conn)
     ensure_qdrant_collection(qdrant)
 
     for p in paths:
         enroll_video(p, sess, pg_conn, qdrant, yaw_thresh, pitch_thresh,
-                     landmarker, engine_conf, engine_nms, aug_cfg, crop_padding, blur_thresh)
+                     landmarker, det, engine_conf, engine_nms, aug_cfg, crop_padding, blur_thresh)
 
     pg_conn.close()
     print("Done.")

@@ -4,5 +4,6 @@ numpy
 psycopg2-binary
 qdrant-client
 pyyaml
-mediapipe
+mediapipe          # enrollment only — head-pose bucketing
+insightface        # SCRFD det_10g — 5-point alignment (enroll + recognize)
 PyGObject

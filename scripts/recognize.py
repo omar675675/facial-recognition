@@ -10,6 +10,7 @@ Usage:
 import os
 import sys
 import time
+import queue
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -33,17 +34,11 @@ sys.path.insert(0, str(RTSP_TRT_DIR.parent))
 from rtsp_trt import Pipeline, StatsEvent, DetectionEvent  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from align import align_face, load_landmarker  # noqa: E402
+from align import align_face, load_scrfd  # noqa: E402
 
-# FaceLandmarker isn't thread-safe → one instance per worker thread.
-_tls = threading.local()
-
-def _get_landmarker():
-    lm = getattr(_tls, "landmarker", None)
-    if lm is None:
-        lm = load_landmarker()
-        _tls.landmarker = lm
-    return lm
+# SCRFD's onnxruntime session is thread-safe (anchor cache pre-warmed at load),
+# so one shared detector serves the whole worker pool — no per-thread state.
+_scrfd = None
 
 # ── settings ───────────────────────────────────────────────────────────────────
 
@@ -55,39 +50,76 @@ ENROLL_CFG        = REPO_DIR / "config.yaml"
 
 _IN_NAME  = "input.1"
 _OUT_NAME = "683"
+_MAX_BATCH = 10   # engine's max optimization-profile batch (min 1, opt 4, max 10)
 
-class Recognizer:
-    def __init__(self, engine_path: str):
+class BatchEmbedder:
+    """Micro-batching ArcFace embedder.
+
+    Worker threads call ``embed(crop)`` and block on a per-request event; a
+    single GPU thread groups whatever requests have piled up into one batched
+    TensorRT inference. This replaces the per-call lock — instead of serializing
+    every face at ~1.5ms each (~660/s ceiling), concurrent faces ride one GPU
+    call, lifting the ceiling roughly with the batch size. Batching is
+    opportunistic (no added wait): under low load a batch is just 1.
+    """
+
+    def __init__(self, engine_path: str, max_batch: int = _MAX_BATCH):
         logger = trt.Logger(trt.Logger.WARNING)
         with open(engine_path, "rb") as f:
             self._engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
         self._ctx    = self._engine.create_execution_context()
-        self._ctx.set_input_shape(_IN_NAME, (1, 3, 112, 112))
-        self._h_in   = cuda.pagelocked_empty((1, 3, 112, 112), np.float32)
-        self._h_out  = cuda.pagelocked_empty((1, 512),         np.float32)
+        self._max    = max_batch
+        self._h_in   = cuda.pagelocked_empty((max_batch, 3, 112, 112), np.float32)
+        self._h_out  = cuda.pagelocked_empty((max_batch, 512),         np.float32)
         self._d_in   = cuda.mem_alloc(self._h_in.nbytes)
         self._d_out  = cuda.mem_alloc(self._h_out.nbytes)
         self._stream = cuda.Stream()
         self._ctx.set_tensor_address(_IN_NAME,  int(self._d_in))
         self._ctx.set_tensor_address(_OUT_NAME, int(self._d_out))
-        self._lock   = threading.Lock()
-        print(f"[recognizer] {Path(engine_path).name}  TensorRT {trt.__version__}")
+        self._q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+        print(f"[recognizer] {Path(engine_path).name}  TensorRT {trt.__version__}  batch<={max_batch}")
 
-    def embed(self, crop_bgr: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _preprocess(crop_bgr: np.ndarray) -> np.ndarray:
         img = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
         img = (img - 127.5) / 127.5
-        with self._lock:
-            np.copyto(self._h_in[0], img.transpose(2, 0, 1))
-            cuda.memcpy_htod_async(self._d_in, self._h_in, self._stream)
-            self._ctx.execute_async_v3(self._stream.handle)
-            cuda.memcpy_dtoh_async(self._h_out, self._d_out, self._stream)
-            self._stream.synchronize()
-            emb = self._h_out[0].copy()
-        return emb / np.linalg.norm(emb)
+        return img.transpose(2, 0, 1)   # (3,112,112)
+
+    def embed(self, crop_bgr: np.ndarray) -> np.ndarray:
+        ev   = threading.Event()
+        slot = [None]
+        self._q.put((self._preprocess(crop_bgr), ev, slot))
+        ev.wait()
+        return slot[0]
+
+    def _run(self):
+        while True:
+            batch = [self._q.get()]                 # block for the first request
+            while len(batch) < self._max:           # grab any already-queued ones, no waiting
+                try:
+                    batch.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+            self._infer(batch)
+
+    def _infer(self, batch):
+        n = len(batch)
+        for i, (img, _, _) in enumerate(batch):
+            self._h_in[i] = img
+        self._ctx.set_input_shape(_IN_NAME, (n, 3, 112, 112))
+        cuda.memcpy_htod_async(self._d_in, self._h_in, self._stream)
+        self._ctx.execute_async_v3(self._stream.handle)
+        cuda.memcpy_dtoh_async(self._h_out, self._d_out, self._stream)
+        self._stream.synchronize()
+        for i, (_, ev, slot) in enumerate(batch):
+            emb = self._h_out[i].copy()
+            slot[0] = emb / np.linalg.norm(emb)
+            ev.set()
 
 
-def load_recognizer() -> Recognizer:
-    return Recognizer(str(MODEL_PATH))
+def load_recognizer() -> BatchEmbedder:
+    return BatchEmbedder(str(MODEL_PATH))
 
 
 def identify(qdrant: QdrantClient, embedding: np.ndarray,
@@ -135,6 +167,7 @@ _labels:        dict = {}   # last-known recognition labels per stream
 _track_labels:  dict = {}   # (sid, track_id) -> (name, score)  — locked labels per track
 _fps:           dict = {}
 _pending:       set  = set()  # streams with a recognition job already in-flight
+_recog_count:   dict = {}   # sid -> cumulative faces recognized (for throughput stats)
 _lock = threading.Lock()
 
 
@@ -157,7 +190,7 @@ def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold, crop_p
 
             # Align to the ArcFace template — must match enrollment exactly.
             t0 = time.perf_counter()
-            aligned = align_face(crop, _get_landmarker())
+            aligned = align_face(crop, _scrfd)
             t_align = time.perf_counter() - t0
             if aligned is None:
                 # No landmarks (tiny / extreme-angle face). Feeding an unaligned
@@ -194,6 +227,7 @@ def _recognize_frame(sid, frame, dets, fps, rec, qdrant, match_threshold, crop_p
 
         with _lock:
             _labels[sid] = {"labels": labels, "fps": fps}
+            _recog_count[sid] = _recog_count.get(sid, 0) + len(labels)
     except Exception as e:
         print(f"[render] {e}", flush=True)
     finally:
@@ -247,7 +281,26 @@ def main():
     cfg      = yaml.safe_load(Path(cfg_path).read_text())
     cfg.setdefault("detection", {})
     cfg["detection"]["conf_threshold"] = engine_conf
-    n        = len(cfg.get("streams", []))
+
+    # Resolve relative file streams against the config's own directory, so a
+    # config with paths like "streams/test1.mp4" works regardless of CWD.
+    # rtsp:// URIs and numeric device indices pass through untouched.
+    cfg_dir = Path(cfg_path).resolve().parent
+    def _resolve(s):
+        if isinstance(s, str) and "://" not in s and not s.lstrip("-").isdigit():
+            p = Path(s)
+            if not p.is_absolute():
+                return str((cfg_dir / p).resolve())
+        return s
+    streams = [_resolve(s) for s in cfg.get("streams", [])]
+    cfg["streams"] = streams
+    missing = [s for s in streams if "://" not in str(s) and not str(s).lstrip("-").isdigit()
+               and not Path(s).exists()]
+    if missing:
+        print("[warn] stream files not found:")
+        for s in missing:
+            print(f"        {s}")
+    n        = len(streams)
 
     cell_w = cfg.get("tiler", {}).get("cell_width",  640)
     cell_h = cfg.get("tiler", {}).get("cell_height", 360)
@@ -255,8 +308,10 @@ def main():
     rows   = (n + cols - 1) // cols
     win_w, win_h = cols * cell_w, rows * cell_h
 
+    global _scrfd
     rec     = load_recognizer()
-    qdrant   = QdrantClient(url=QDRANT_URL)
+    _scrfd   = load_scrfd()
+    qdrant   = QdrantClient(url=QDRANT_URL, prefer_grpc=True)
     executor = ThreadPoolExecutor(max_workers=max(4, n * 2))
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -277,12 +332,24 @@ def main():
         return
 
     print("Running — press Esc to quit")
+    last_report = time.monotonic()
+    last_count  = 0
     try:
         while p.running:
             with _lock:
                 live   = dict(_latest_frame)
                 labels = dict(_labels)
                 fps_snap = dict(_fps)
+                total_recog = sum(_recog_count.values())
+
+            now = time.monotonic()
+            if now - last_report >= 2.0:
+                dt   = now - last_report
+                rate = (total_recog - last_count) / dt
+                fps_str = "  ".join(f"s{sid}:{fps_snap.get(sid,0.0):.0f}"
+                                    for sid in sorted(fps_snap))
+                print(f"[stats] recog={rate:5.0f}/s   pipeline_fps  {fps_str}", flush=True)
+                last_report, last_count = now, total_recog
 
             if live:
                 canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
